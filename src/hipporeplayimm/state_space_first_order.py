@@ -73,6 +73,21 @@ def _score_fragmented(
     return logp, _as_log_probs(posterior)
 
 
+def _normalize_backward_message(message: np.ndarray) -> np.ndarray:
+    """Bound backward messages without changing their relative state weights.
+
+    Backward messages are defined only up to a common positive scale. Dividing
+    by a forward likelihood scale can overflow even when the smoothed posterior
+    is well-defined. Normalize by the largest message entry instead, jointly
+    over all modes and positions for an IMM.
+    """
+
+    maximum = float(np.max(message))
+    if not np.isfinite(maximum) or maximum <= 0.0:
+        raise ValueError("backward message has no finite positive mass")
+    return message / maximum
+
+
 def _forward_backward_first_order(
     log_likelihood: np.ndarray,
     transition: csr_matrix,
@@ -104,7 +119,9 @@ def _forward_backward_first_order(
     beta = np.ones(n_bins, dtype=float)
     smoothed[-1] = filtered[-1]
     for time_index in range(n_time - 1, 0, -1):
-        beta = np.asarray(transition.T @ (scaled[time_index] * beta), dtype=float) / scales[time_index]
+        beta = _normalize_backward_message(
+            np.asarray(transition.T @ (scaled[time_index] * beta), dtype=float)
+        )
         gamma = filtered[time_index - 1] * beta
         total = float(gamma.sum())
         smoothed[time_index - 1] = gamma / total if total > 0.0 else filtered[time_index - 1]
@@ -148,7 +165,9 @@ def _forward_backward_first_order_time_varying(
     smoothed[-1] = filtered[-1]
     for time_index in range(n_time - 1, 0, -1):
         transition = transitions[time_index - 1]
-        beta = np.asarray(transition.T @ (scaled[time_index] * beta), dtype=float) / scales[time_index]
+        beta = _normalize_backward_message(
+            np.asarray(transition.T @ (scaled[time_index] * beta), dtype=float)
+        )
         gamma = filtered[time_index - 1] * beta
         total = float(gamma.sum())
         smoothed[time_index - 1] = gamma / total if total > 0.0 else filtered[time_index - 1]
@@ -217,7 +236,7 @@ def _score_first_order_imm(
                     scaled[time_index] * beta[dst_idx],
                     valid_bin_mask=valid_bin_mask,
                 )
-        beta = beta_prev / scales[time_index]
+        beta = _normalize_backward_message(beta_prev)
         gamma = filtered[time_index - 1] * beta
         total = float(gamma.sum())
         smoothed[time_index - 1] = gamma / total if total > 0.0 else filtered[time_index - 1]
