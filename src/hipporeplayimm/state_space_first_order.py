@@ -8,6 +8,7 @@ from scipy.special import logsumexp
 
 from .encoding import LogEmissionTensor
 from .models import _normalize_log_weights
+from .state_space_forward_backward import first_order_forward_backward, first_order_imm_forward_backward
 from .state_space_utils import (
     _as_log_probs,
     _coerce_valid_bin_mask,
@@ -78,37 +79,7 @@ def _forward_backward_first_order(
     transition: csr_matrix,
     valid_bin_mask: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
-    n_time, n_bins = log_likelihood.shape
-    scaled, offsets = _scaled_emissions(log_likelihood, valid_bin_mask=valid_bin_mask)
-    filtered = np.zeros((n_time, n_bins), dtype=float)
-    scales = np.zeros(n_time, dtype=float)
-
-    alpha = scaled[0] * _uniform_probabilities(n_bins, valid_bin_mask)
-    scales[0] = float(alpha.sum())
-    if scales[0] <= 0.0:
-        raise ValueError("first emission row has no finite likelihood mass")
-    alpha /= scales[0]
-    filtered[0] = alpha
-    logp = float(np.log(scales[0]) + offsets[0])
-
-    for time_index in range(1, n_time):
-        alpha = np.asarray(transition @ alpha, dtype=float) * scaled[time_index]
-        scales[time_index] = float(alpha.sum())
-        if scales[time_index] <= 0.0:
-            raise ValueError(f"emission row {time_index} has no finite predicted mass")
-        alpha /= scales[time_index]
-        filtered[time_index] = alpha
-        logp += float(np.log(scales[time_index]) + offsets[time_index])
-
-    smoothed = np.zeros_like(filtered)
-    beta = np.ones(n_bins, dtype=float)
-    smoothed[-1] = filtered[-1]
-    for time_index in range(n_time - 1, 0, -1):
-        beta = np.asarray(transition.T @ (scaled[time_index] * beta), dtype=float) / scales[time_index]
-        gamma = filtered[time_index - 1] * beta
-        total = float(gamma.sum())
-        smoothed[time_index - 1] = gamma / total if total > 0.0 else filtered[time_index - 1]
-    return logp, _as_log_probs(smoothed)
+    return first_order_forward_backward(log_likelihood, transition, valid_bin_mask)
 
 
 def _forward_backward_first_order_time_varying(
@@ -118,41 +89,7 @@ def _forward_backward_first_order_time_varying(
 ) -> tuple[float, np.ndarray]:
     """Forward/backward recursion with one transition matrix per step."""
 
-    n_time, n_bins = log_likelihood.shape
-    if len(transitions) != max(n_time - 1, 0):
-        raise ValueError("transitions must contain one matrix per adjacent time-bin pair")
-    scaled, offsets = _scaled_emissions(log_likelihood, valid_bin_mask=valid_bin_mask)
-    filtered = np.zeros((n_time, n_bins), dtype=float)
-    scales = np.zeros(n_time, dtype=float)
-
-    alpha = scaled[0] * _uniform_probabilities(n_bins, valid_bin_mask)
-    scales[0] = float(alpha.sum())
-    if scales[0] <= 0.0:
-        raise ValueError("first emission row has no finite likelihood mass")
-    alpha /= scales[0]
-    filtered[0] = alpha
-    logp = float(np.log(scales[0]) + offsets[0])
-
-    for time_index in range(1, n_time):
-        transition = transitions[time_index - 1]
-        alpha = np.asarray(transition @ alpha, dtype=float) * scaled[time_index]
-        scales[time_index] = float(alpha.sum())
-        if scales[time_index] <= 0.0:
-            raise ValueError(f"emission row {time_index} has no finite predicted mass")
-        alpha /= scales[time_index]
-        filtered[time_index] = alpha
-        logp += float(np.log(scales[time_index]) + offsets[time_index])
-
-    smoothed = np.zeros_like(filtered)
-    beta = np.ones(n_bins, dtype=float)
-    smoothed[-1] = filtered[-1]
-    for time_index in range(n_time - 1, 0, -1):
-        transition = transitions[time_index - 1]
-        beta = np.asarray(transition.T @ (scaled[time_index] * beta), dtype=float) / scales[time_index]
-        gamma = filtered[time_index - 1] * beta
-        total = float(gamma.sum())
-        smoothed[time_index - 1] = gamma / total if total > 0.0 else filtered[time_index - 1]
-    return logp, _as_log_probs(smoothed)
+    return first_order_forward_backward(log_likelihood, transitions, valid_bin_mask)
 
 
 def _score_first_order_imm(
@@ -165,64 +102,13 @@ def _score_first_order_imm(
     mode_stickiness: float,
     valid_bin_mask: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray]:
-    modes = ("stationary", "diffusion", "fragmented")
-    n_modes = len(modes)
-    n_time, n_bins = log_likelihood.shape
-    transitions = {
-        "stationary": _gaussian_transition_matrix(bin_centers, stationary_sigma_cm, max_step_sigma, valid_bin_mask=valid_bin_mask),
-        "diffusion": _gaussian_transition_matrix(bin_centers, diffusion_sigma_cm, max_step_sigma, valid_bin_mask=valid_bin_mask),
-        "fragmented": None,
-    }
-    mode_transition = _mode_transition_matrix(n_modes, mode_stickiness)
-    scaled, offsets = _scaled_emissions(log_likelihood, valid_bin_mask=valid_bin_mask)
-    filtered = np.zeros((n_time, n_modes, n_bins), dtype=float)
-    scales = np.zeros(n_time, dtype=float)
-
-    alpha = np.tile(scaled[0] * _uniform_probabilities(n_bins, valid_bin_mask) / n_modes, (n_modes, 1))
-    scales[0] = float(alpha.sum())
-    if scales[0] <= 0.0:
-        raise ValueError("first emission row has no finite likelihood mass")
-    alpha /= scales[0]
-    filtered[0] = alpha
-    logp = float(np.log(scales[0]) + offsets[0])
-
-    for time_index in range(1, n_time):
-        predicted = np.zeros_like(alpha)
-        for dst_idx, dst_mode in enumerate(modes):
-            dst = np.zeros(n_bins, dtype=float)
-            for src_idx in range(n_modes):
-                dst += mode_transition[src_idx, dst_idx] * _apply_transition(
-                    transitions[dst_mode],
-                    alpha[src_idx],
-                    valid_bin_mask=valid_bin_mask,
-                )
-            predicted[dst_idx] = dst
-        alpha = predicted * scaled[time_index][None, :]
-        scales[time_index] = float(alpha.sum())
-        if scales[time_index] <= 0.0:
-            raise ValueError(f"emission row {time_index} has no finite predicted mass")
-        alpha /= scales[time_index]
-        filtered[time_index] = alpha
-        logp += float(np.log(scales[time_index]) + offsets[time_index])
-
-    smoothed = np.zeros_like(filtered)
-    beta = np.ones((n_modes, n_bins), dtype=float)
-    smoothed[-1] = filtered[-1]
-    for time_index in range(n_time - 1, 0, -1):
-        beta_prev = np.zeros_like(beta)
-        for src_idx in range(n_modes):
-            for dst_idx, dst_mode in enumerate(modes):
-                beta_prev[src_idx] += mode_transition[src_idx, dst_idx] * _apply_transition_backward(
-                    transitions[dst_mode],
-                    scaled[time_index] * beta[dst_idx],
-                    valid_bin_mask=valid_bin_mask,
-                )
-        beta = beta_prev / scales[time_index]
-        gamma = filtered[time_index - 1] * beta
-        total = float(gamma.sum())
-        smoothed[time_index - 1] = gamma / total if total > 0.0 else filtered[time_index - 1]
-
-    return logp, _as_log_probs(smoothed.sum(axis=1)), smoothed.sum(axis=2)
+    stationary = _gaussian_transition_matrix(bin_centers, stationary_sigma_cm, max_step_sigma, valid_bin_mask=valid_bin_mask)
+    diffusion = _gaussian_transition_matrix(bin_centers, diffusion_sigma_cm, max_step_sigma, valid_bin_mask=valid_bin_mask)
+    mode_transition = _mode_transition_matrix(3, mode_stickiness)
+    return first_order_imm_forward_backward(
+        log_likelihood, stationary, diffusion,
+        [mode_transition] * max(len(log_likelihood) - 1, 0), valid_bin_mask,
+    )
 
 
 def _apply_transition(

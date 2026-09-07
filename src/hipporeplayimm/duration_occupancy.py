@@ -17,6 +17,7 @@ from scipy.special import logsumexp
 
 from .duration_dynamics import attach_duration_metadata, transition_durations_s
 from .evidence_reporting import DEGENERATE_SINGLE_BIN_EVIDENCE_SUPPORT
+from .state_space_forward_backward import first_order_forward_backward, first_order_imm_forward_backward
 from .state_space_utils import _first_order_imm_content_diagnostics
 
 
@@ -659,40 +660,7 @@ def _transition_at(transitions, transition_index: int):
 
 
 def _forward_backward_variable(ss, log_likelihood, transitions, *, valid_bin_mask=None):
-    n_time, n_bins = log_likelihood.shape
-    scaled, offsets = ss._scaled_emissions(log_likelihood, valid_bin_mask=valid_bin_mask)
-    filtered = np.zeros((n_time, n_bins), dtype=float)
-    scales = np.zeros(n_time, dtype=float)
-
-    alpha = scaled[0] * _uniform_probabilities(n_bins, valid_bin_mask)
-    scales[0] = float(alpha.sum())
-    if scales[0] <= 0.0:
-        raise ValueError("first emission row has no finite likelihood mass")
-    alpha /= scales[0]
-    filtered[0] = alpha
-    logp = float(np.log(scales[0]) + offsets[0])
-
-    for time_index in range(1, n_time):
-        alpha = np.asarray(_transition_at(transitions, time_index - 1) @ alpha, dtype=float) * scaled[time_index]
-        scales[time_index] = float(alpha.sum())
-        if scales[time_index] <= 0.0:
-            raise ValueError(f"emission row {time_index} has no finite predicted mass")
-        alpha /= scales[time_index]
-        filtered[time_index] = alpha
-        logp += float(np.log(scales[time_index]) + offsets[time_index])
-
-    smoothed = np.zeros_like(filtered)
-    beta = np.ones(n_bins, dtype=float)
-    smoothed[-1] = filtered[-1]
-    for time_index in range(n_time - 1, 0, -1):
-        beta = np.asarray(
-            _transition_at(transitions, time_index - 1).T @ (scaled[time_index] * beta),
-            dtype=float,
-        ) / scales[time_index]
-        gamma = filtered[time_index - 1] * beta
-        total = float(gamma.sum())
-        smoothed[time_index - 1] = gamma / total if total > 0.0 else filtered[time_index - 1]
-    return logp, ss._as_log_probs(smoothed)
+    return first_order_forward_backward(log_likelihood, transitions, valid_bin_mask)
 
 
 def _score_first_order_imm_variable(
@@ -707,80 +675,15 @@ def _score_first_order_imm_variable(
     mode_transitions=None,
     valid_bin_mask=None,
 ):
-    modes = ("stationary", "diffusion", "fragmented")
-    n_modes = len(modes)
-    n_time, n_bins = log_likelihood.shape
     mode_transitions = _resolve_mode_transitions(
-        ss,
-        n_modes,
-        mode_stickiness,
-        mode_transitions,
-        max(n_time - 1, 0),
+        ss, 3, mode_stickiness, mode_transitions, max(len(log_likelihood) - 1, 0),
     )
-    transitions = {
-        "stationary": ss._gaussian_transition_matrix(
-            bin_centers,
-            stationary_sigma_cm,
-            max_step_sigma,
-            valid_bin_mask=valid_bin_mask,
-        ),
-        "diffusion": diffusion_transitions,
-        "fragmented": None,
-    }
-    scaled, offsets = ss._scaled_emissions(log_likelihood, valid_bin_mask=valid_bin_mask)
-    filtered = np.zeros((n_time, n_modes, n_bins), dtype=float)
-    scales = np.zeros(n_time, dtype=float)
-
-    alpha = np.tile(scaled[0] * _uniform_probabilities(n_bins, valid_bin_mask) / n_modes, (n_modes, 1))
-    scales[0] = float(alpha.sum())
-    if scales[0] <= 0.0:
-        raise ValueError("first emission row has no finite likelihood mass")
-    alpha /= scales[0]
-    filtered[0] = alpha
-    logp = float(np.log(scales[0]) + offsets[0])
-
-    for time_index in range(1, n_time):
-        predicted = np.zeros_like(alpha)
-        mode_transition = mode_transitions[time_index - 1]
-        for dst_idx, dst_mode in enumerate(modes):
-            dst = np.zeros(n_bins, dtype=float)
-            for src_idx in range(n_modes):
-                transition = transitions[dst_mode]
-                if transition is None:
-                    value = _uniform_probabilities(n_bins, valid_bin_mask) * float(alpha[src_idx].sum())
-                else:
-                    value = np.asarray(_transition_at(transition, time_index - 1) @ alpha[src_idx], dtype=float)
-                dst += mode_transition[src_idx, dst_idx] * value
-            predicted[dst_idx] = dst
-        alpha = predicted * scaled[time_index][None, :]
-        scales[time_index] = float(alpha.sum())
-        if scales[time_index] <= 0.0:
-            raise ValueError(f"emission row {time_index} has no finite predicted mass")
-        alpha /= scales[time_index]
-        filtered[time_index] = alpha
-        logp += float(np.log(scales[time_index]) + offsets[time_index])
-
-    smoothed = np.zeros_like(filtered)
-    beta = np.ones((n_modes, n_bins), dtype=float)
-    smoothed[-1] = filtered[-1]
-    for time_index in range(n_time - 1, 0, -1):
-        beta_prev = np.zeros_like(beta)
-        mode_transition = mode_transitions[time_index - 1]
-        for src_idx in range(n_modes):
-            for dst_idx, dst_mode in enumerate(modes):
-                transition = transitions[dst_mode]
-                values = scaled[time_index] * beta[dst_idx]
-                if transition is None:
-                    value = _uniform_backward(values, valid_bin_mask)
-                else:
-                    value = np.asarray(_transition_at(transition, time_index - 1).T @ values, dtype=float)
-                beta_prev[src_idx] += mode_transition[src_idx, dst_idx] * value
-        beta = beta_prev / scales[time_index]
-        gamma = filtered[time_index - 1] * beta
-        total = float(gamma.sum())
-        smoothed[time_index - 1] = gamma / total if total > 0.0 else filtered[time_index - 1]
-
-    return logp, ss._as_log_probs(smoothed.sum(axis=1)), smoothed.sum(axis=2)
+    stationary = ss._gaussian_transition_matrix(
+        bin_centers, stationary_sigma_cm, max_step_sigma, valid_bin_mask=valid_bin_mask,
+    )
+    return first_order_imm_forward_backward(
+        log_likelihood, stationary, diffusion_transitions, mode_transitions, valid_bin_mask,
+    )
 
 
 def _score_momentum_duration(
